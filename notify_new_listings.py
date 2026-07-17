@@ -11,7 +11,8 @@ Behavior:
 
 Required environment variables:
     TELEGRAM_BOT_TOKEN  - your bot's token from @BotFather
-    TELEGRAM_CHAT_ID    - your Telegram chat id
+    TELEGRAM_CHAT_ID    - one chat id, or several comma-separated
+                          (e.g. "111111,222222") to notify multiple people
     CROUS_COOKIE        - a fresh 'Cookie' header value from your browser
 """
 
@@ -63,16 +64,34 @@ PAYLOAD = {
     "toolMechanism": "residual",
 }
 
+# Only notify for listings in these cities (matched against the address,
+# case-insensitive). Add/remove cities here as needed.
+CITY_KEYWORDS = ["ROUEN", "LYON", "VILLEURBANNE"]
+
+# Shown in each notification. This is the academic-year campaign this
+# search tool (idTool 47) corresponds to — update it if CROUS opens a new
+# campaign for a different year.
+SCHOOL_YEAR = "2026/2027"
+
+
+def matches_city(address: str) -> bool:
+    if not address:
+        return False
+    address_upper = address.upper()
+    return any(city in address_upper for city in CITY_KEYWORDS)
+
 
 def send_telegram(text: str) -> None:
     api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    resp = requests.post(
-        api_url,
-        json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
-        timeout=15,
-    )
-    if not resp.ok:
-        print(f"Telegram send failed: {resp.status_code} {resp.text}", file=sys.stderr)
+    chat_ids = [c.strip() for c in TELEGRAM_CHAT_ID.split(",") if c.strip()]
+    for chat_id in chat_ids:
+        resp = requests.post(
+            api_url,
+            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+            timeout=15,
+        )
+        if not resp.ok:
+            print(f"Telegram send failed for chat {chat_id}: {resp.status_code} {resp.text}", file=sys.stderr)
 
 
 def fetch_all_listings(page_size: int = 24, max_pages: int = 50) -> list:
@@ -96,26 +115,31 @@ def fetch_all_listings(page_size: int = 24, max_pages: int = 50) -> list:
 
 def format_item(item: dict) -> str:
     residence = item.get("residence", {}) or {}
+    entity_name = (residence.get("entity") or {}).get("name") or "CROUS"
+    residence_label = residence.get("label", "Résidence inconnue")
+
     rents = []
     for mode in item.get("occupationModes", []) or []:
         rent = mode.get("rent", {}) or {}
         if rent.get("min") is not None:
             rents.append(rent["min"])
     rent_min = f"{min(rents) / 100:.0f}€/mois" if rents else "n/a"
+
     listing_url = f"https://trouverunlogement.lescrous.fr/tools/47/accommodations/{item.get('id', '')}"
+
     return (
-        f"🏠 <b>{residence.get('label', 'Résidence inconnue')}</b>\n"
-        f"{item.get('label', '')}\n"
+        f"🏠 {entity_name} — {residence_label}\n"
+        f"📅 {SCHOOL_YEAR}\n"
         f"📍 {residence.get('address', '')}\n"
-        f"💶 à partir de {rent_min}\n"
-        f"🔗 {listing_url}"
+        f"💶 {rent_min}\n\n"
+        f'🔗<a href="{listing_url}">Voir l\'offre sur le Crous</a>'
     )
 
 
 def main() -> None:
     seen_ids = set()
-    if SEEN_FILE.exists():
-        seen_ids = set(json.loads(SEEN_FILE.read_text()))
+    # if SEEN_FILE.exists():
+    #     seen_ids = set(json.loads(SEEN_FILE.read_text()))
 
     try:
         items = fetch_all_listings()
@@ -134,11 +158,16 @@ def main() -> None:
         SEEN_FILE.write_text("[]")
         return
 
-    current_ids = {str(item.get("id")) for item in items}
+    filtered_items = [
+        item for item in items
+        if matches_city((item.get("residence") or {}).get("address"))
+    ]
+
+    current_ids = {str(item.get("id")) for item in filtered_items}
     new_ids = current_ids - seen_ids
 
     if new_ids:
-        new_items = [i for i in items if str(i.get("id")) in new_ids]
+        new_items = [i for i in filtered_items if str(i.get("id")) in new_ids]
         for item in new_items:
             send_telegram(format_item(item))
         print(f"Sent {len(new_items)} new listing notification(s).")
